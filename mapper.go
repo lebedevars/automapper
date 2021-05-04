@@ -4,33 +4,50 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sync"
 )
 
 var (
-	ErrNotAPtr          = errors.New("value is not a ptr")
-	ErrNotAFn           = errors.New("value is not a function")
-	ErrMissingConverter = errors.New("converter is missing for types")
-	ErrConverter        = errors.New("converter error")
+	ErrNotAPtr                   = errors.New("value is not a ptr")
+	ErrNotAFn                    = errors.New("value is not a function")
+	ErrMissingConverter          = errors.New("converter is missing for types")
+	ErrConverter                 = errors.New("converter error")
+	ErrConverterErrorUnknownType = errors.New("converter 2nd return value cannot be converted to error")
 )
 
 type converterInfo struct {
 	from, to reflect.Type
 }
 
+type structMappingInfo struct {
+	from, to reflect.Type
+}
+
+type fieldMappingInfo struct {
+	fromIndex, toIndex int
+	mapperFunc         mapperFunc
+}
+
 // Mapper maps struct values.
 type Mapper struct {
-	converters map[converterInfo]reflect.Value
-	strats     map[supportedType]mapperFunc
+	mu            sync.Mutex
+	converters    map[converterInfo]reflect.Value
+	strats        map[supportedType]mapperFunc
+	knownMappings map[structMappingInfo][]fieldMappingInfo
 }
 
 type fieldInfo struct {
-	tp  reflect.Type
-	val reflect.Value
+	index int
+	val   reflect.Value
 }
 
 // New returns new Mapper.
 func New() *Mapper {
-	m := &Mapper{converters: make(map[converterInfo]reflect.Value)}
+	m := &Mapper{
+		mu:            sync.Mutex{},
+		converters:    make(map[converterInfo]reflect.Value),
+		knownMappings: make(map[structMappingInfo][]fieldMappingInfo),
+	}
 	m.strats = m.initStrategies()
 	return m
 }
@@ -53,14 +70,21 @@ func (m *Mapper) Set(converter interface{}) error {
 
 // Map maps two structs or two slices of structs.
 func (m *Mapper) Map(from, to interface{}) error {
+	typeFrom := reflect.TypeOf(from)
+	typeTo := reflect.TypeOf(to)
 	valFrom := reflect.ValueOf(from)
 	valTo := reflect.ValueOf(to)
 
-	if valFrom.Kind() != reflect.Ptr || valTo.Kind() != reflect.Ptr {
-		return ErrNotAPtr
+	if (typeFrom.Kind() == reflect.Ptr && typeFrom.Elem().Kind() == reflect.Slice && isStructOrPtrToStruct(typeFrom.Elem().Elem())) &&
+		(typeTo.Kind() == reflect.Ptr && typeTo.Elem().Kind() == reflect.Slice && isStructOrPtrToStruct(typeTo.Elem().Elem())) {
+		return m.mapSlicesFunc(valFrom.Elem(), valTo.Elem())
 	}
 
-	return m.mapStructs(valFrom.Elem(), valTo.Elem())
+	if isStructOrPtrToStruct(typeFrom) && isStructOrPtrToStruct(typeTo) {
+		return m.mapStructs(valFrom.Elem(), valTo.Elem())
+	}
+
+	return nil
 }
 
 // from, to must be struct values.
@@ -69,66 +93,100 @@ func (m *Mapper) mapStructs(from, to reflect.Value) error {
 		return nil
 	}
 
-	fromFields := make(map[string]fieldInfo)
-	for i := 0; i < from.NumField(); i++ {
-		// skip zero or nil values
-		if from.Field(i).IsZero() || (from.Field(i).Kind() == reflect.Ptr && from.Field(i).IsNil()) {
-			continue
-		}
-
-		field := from.Field(i)
-		t := from.Type().Field(i).Type
-		fromFields[from.Type().Field(i).Name] = fieldInfo{
-			tp:  t,
-			val: field,
+	m.mu.Lock()
+	mappingInfo := structMappingInfo{from: from.Type(), to: to.Type()}
+	if knownMapping, ok := m.knownMappings[mappingInfo]; ok {
+		err := m.mapKnownStruct(knownMapping, from, to)
+		if err != nil {
+			return err
 		}
 	}
 
-	toFields := make(map[string]fieldInfo)
-	for i := 0; i < to.NumField(); i++ {
-		if !to.Field(i).CanSet() {
-			continue
-		}
+	m.knownMappings[mappingInfo] = make([]fieldMappingInfo, 0)
+	m.mu.Unlock()
 
-		field := to.Field(i)
-		t := to.Type().Field(i).Type
-		toFields[to.Type().Field(i).Name] = fieldInfo{
-			tp:  t,
-			val: field,
-		}
-	}
-
+	fromFields, toFields := getFieldInfo(from, to)
 	for name, fromVal := range fromFields {
 		toVal, ok := toFields[name]
 		if !ok {
 			continue
 		}
 
-		converter, ok := m.converters[converterInfo{from: fromVal.tp, to: toVal.val.Type()}]
-		if ok {
-			outArgs := converter.Call([]reflect.Value{fromVal.val})
-			if len(outArgs) == 1 {
-				toVal.val.Set(outArgs[0])
-				return nil
-			}
-
-			err := outArgs[1].Interface().(error)
-			if err != nil {
-				return fmt.Errorf("%w, field '%s': %v", ErrConverter, name, err)
-			}
-		}
-
-		mappingType := detectMappingType(fromVal, toVal)
+		mappingType := m.detectMappingType(fromVal, toVal)
 		if mappingType != unsupported {
-			err := m.strats[mappingType](fromVal, toVal)
+			err := m.strats[mappingType](fromVal.val, toVal.val)
 			if err != nil {
 				return err
 			}
+
+			m.mu.Lock()
+			m.knownMappings[mappingInfo] = append(m.knownMappings[mappingInfo], fieldMappingInfo{
+				fromIndex:  fromVal.index,
+				toIndex:    toVal.index,
+				mapperFunc: m.strats[mappingType],
+			})
+			m.mu.Unlock()
 
 			continue
 		}
 
 		return fmt.Errorf("%w '%s -> %s'", ErrMissingConverter, fromVal.val.Type(), toVal.val.Type())
+	}
+
+	return nil
+}
+
+func getFieldInfo(from, to reflect.Value) (fromFields, toFields map[string]fieldInfo) {
+	fromFields = make(map[string]fieldInfo)
+	toFields = make(map[string]fieldInfo)
+	for i := 0; i < from.NumField(); i++ {
+		// skip zero or nil values
+		fieldVal := from.Field(i)
+		if fieldVal.IsZero() || (fieldVal.Kind() == reflect.Ptr && fieldVal.IsNil()) {
+			continue
+		}
+
+		fieldType := from.Type().Field(i)
+		name := fieldType.Name
+		mapperTag, ok := fieldType.Tag.Lookup("mapper")
+		if ok && mapperTag != "" {
+			name = mapperTag
+		}
+
+		fromFields[name] = fieldInfo{
+			index: i,
+			val:   fieldVal,
+		}
+	}
+
+	for i := 0; i < to.NumField(); i++ {
+		fieldVal := to.Field(i)
+		if !fieldVal.CanSet() {
+			continue
+		}
+
+		fieldType := to.Type().Field(i)
+		name := fieldType.Name
+		mapperTag, ok := fieldType.Tag.Lookup("mapper")
+		if ok && mapperTag != "" {
+			name = mapperTag
+		}
+
+		toFields[name] = fieldInfo{
+			index: i,
+			val:   fieldVal,
+		}
+	}
+
+	return fromFields, toFields
+}
+
+func (m *Mapper) mapKnownStruct(mappingInfo []fieldMappingInfo, from, to reflect.Value) error {
+	for _, fieldInfo := range mappingInfo {
+		err := fieldInfo.mapperFunc(from.Field(fieldInfo.fromIndex), to.Field(fieldInfo.toIndex))
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil

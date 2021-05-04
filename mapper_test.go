@@ -25,11 +25,11 @@ type Simple2 struct {
 }
 
 type Embedded1 struct {
-	Simple1
+	Simple1 `mapper:"simple"`
 }
 
 type Embedded2 struct {
-	Simple2
+	Simple2 `mapper:"simple"`
 }
 
 type Structs1 struct {
@@ -91,13 +91,7 @@ func TestMapper_Map_Simple(t *testing.T) {
 		Float64: 1,
 		Time:    testTime,
 	}
-
-	simple2 := Simple2{
-		Int:     1,
-		String:  "string",
-		Float64: 1,
-		Time:    testTime,
-	}
+	simple2 := Simple2{}
 
 	m := automapper.New()
 	err := m.Map(&simple1, &simple2)
@@ -115,24 +109,13 @@ func TestMapper_Map_Structs(t *testing.T) {
 		Float64: 1,
 		Time:    testTime,
 	}
-	simple2 := Simple2{
-		Int:     1,
-		String:  "string",
-		Float64: 1,
-		Time:    testTime,
-	}
 	from := Structs1{
 		Field1: simple1,
 		Field2: simple1,
 		Field3: &simple1,
 		Field4: &simple1,
 	}
-	to := Structs2{
-		Field1: simple2,
-		Field2: &simple2,
-		Field3: simple2,
-		Field4: &simple2,
-	}
+	to := Structs2{}
 
 	m := automapper.New()
 	err := m.Map(&from, &to)
@@ -144,7 +127,7 @@ func TestMapper_Map_Structs(t *testing.T) {
 	assert.EqualValues(t, *from.Field4, *to.Field4)
 }
 
-func TestMapper_Map_Slices(t *testing.T) {
+func TestMapper_Map_Slices_Params(t *testing.T) {
 	t.Parallel()
 	testTime := time.Date(2021, 1, 1, 0, 0, 0, 0, time.Local)
 	simple1 := Simple1{
@@ -153,7 +136,21 @@ func TestMapper_Map_Slices(t *testing.T) {
 		Float64: 1,
 		Time:    testTime,
 	}
-	simple2 := Simple2{
+
+	from := []Simple1{simple1}
+	to := []Simple2{}
+
+	m := automapper.New()
+	err := m.Map(&from, &to)
+
+	assert.NoError(t, err)
+	assert.EqualValues(t, from[0], to[0])
+}
+
+func TestMapper_Map_Slices_Fields(t *testing.T) {
+	t.Parallel()
+	testTime := time.Date(2021, 1, 1, 0, 0, 0, 0, time.Local)
+	simple1 := Simple1{
 		Int:     1,
 		String:  "string",
 		Float64: 1,
@@ -165,12 +162,7 @@ func TestMapper_Map_Slices(t *testing.T) {
 		Field3: []*Simple1{&simple1},
 		Field4: []*Simple1{&simple1},
 	}
-	to := Slices2{
-		Field1: []Simple2{simple2},
-		Field2: []*Simple2{&simple2},
-		Field3: []Simple2{simple2},
-		Field4: []*Simple2{&simple2},
-	}
+	to := Slices2{}
 
 	m := automapper.New()
 	err := m.Map(&from, &to)
@@ -182,16 +174,10 @@ func TestMapper_Map_Slices(t *testing.T) {
 	assert.EqualValues(t, *from.Field4[0], *to.Field4[0])
 }
 
-func TestMapper_Map_Arrays(t *testing.T) {
+func TestMapper_Map_Array_Fields(t *testing.T) {
 	t.Parallel()
 	testTime := time.Date(2021, 1, 1, 0, 0, 0, 0, time.Local)
 	simple1 := Simple1{
-		Int:     1,
-		String:  "string",
-		Float64: 1,
-		Time:    testTime,
-	}
-	simple2 := Simple2{
 		Int:     1,
 		String:  "string",
 		Float64: 1,
@@ -203,12 +189,7 @@ func TestMapper_Map_Arrays(t *testing.T) {
 		Field3: [1]*Simple1{&simple1},
 		Field4: [1]*Simple1{&simple1},
 	}
-	to := Arrays2{
-		Field1: [1]Simple2{simple2},
-		Field2: [1]*Simple2{&simple2},
-		Field3: [1]Simple2{simple2},
-		Field4: [1]*Simple2{&simple2},
-	}
+	to := Arrays2{}
 
 	m := automapper.New()
 	err := m.Map(&from, &to)
@@ -236,30 +217,21 @@ func TestMapper_Map_NilStructs(t *testing.T) {
 func TestMapper_MapEmbedded(t *testing.T) {
 	t.Parallel()
 	testTime := time.Date(2021, 1, 1, 0, 0, 0, 0, time.Local)
-	simple1 := Simple1{
-		Int:     1,
-		String:  "string",
-		Float64: 1,
-		Time:    testTime,
-	}
-	simple2 := Simple2{
-		Int:     1,
-		String:  "string",
-		Float64: 1,
-		Time:    testTime,
-	}
 	from := Embedded1{
-		Simple1: simple1,
+		Simple1: Simple1{
+			Int:     1,
+			String:  "string",
+			Float64: 1,
+			Time:    testTime,
+		},
 	}
-	to := Embedded2{
-		Simple2: simple2,
-	}
+	to := Embedded2{}
 
 	m := automapper.New()
 	err := m.Map(&from, &to)
 
 	assert.NoError(t, err)
-	assert.EqualValues(t, simple1, simple2)
+	assert.EqualValues(t, from.Simple1, to.Simple2)
 }
 
 func TestMapper_Map_Converter_Err(t *testing.T) {
